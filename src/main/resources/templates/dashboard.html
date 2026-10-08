@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>UPI Offline Mesh — Demo</title>
+    <link rel="stylesheet" th:href="@{/css/dashboard.css}">
+</head>
+<body>
+<div class="container">
+    <header class="hero-header">
+        <div class="hero-content">
+            <span class="hero-eyebrow">OFFLINE PAYMENT SIMULATOR</span>
+            <h1>UPI Offline Mesh</h1>
+            <p class="hero-description">
+                Follow an encrypted payment as it travels across simulated phones to the backend.
+                This demo does not connect to real UPI or Bluetooth.
+            </p>
+        </div>
+        <div class="hero-icon" aria-hidden="true">📡</div>
+    </header>
+
+    <div class="controls">
+        <h3>🎬 Demo Flow</h3>
+        <div id="actionFeedback" class="action-feedback is-idle" role="status" aria-live="polite">
+            Ready — choose an action to start the demo.
+        </div>
+
+        <div class="flow-step step-payment">
+            <div class="step-copy"><span class="step-num">1</span><strong>Compose a payment</strong>
+                <span class="small">This simulates the sender’s phone.</span>
+            </div>
+            <div class="payment-fields">
+                <label for="senderVpa">From
+                    <select id="senderVpa" name="senderVpa">
+                        <option>alice@demo</option>
+                        <option>bob@demo</option>
+                        <option>carol@demo</option>
+                    </select>
+                </label>
+                <span class="transfer-arrow" aria-hidden="true">→</span>
+                <label for="receiverVpa">To
+                    <select id="receiverVpa" name="receiverVpa">
+                        <option>bob@demo</option>
+                        <option>carol@demo</option>
+                        <option>alice@demo</option>
+                        <option>dave@demo</option>
+                    </select>
+                </label>
+                <label for="amount">Amount
+                    <span class="input-with-prefix"><span>₹</span><input type="number" id="amount" value="500" min="1" step="1"></span>
+                </label>
+                <label for="pin">Demo PIN
+                    <input type="password" id="pin" value="1234" maxlength="4" inputmode="numeric" autocomplete="off">
+                </label>
+                <button onclick="sendPacket(this)">📤 Send to mesh</button>
+            </div>
+        </div>
+
+        <div class="flow-step step-gossip">
+            <div class="step-copy"><span class="step-num">2</span><strong>Forward the packet</strong>
+                <span class="small">Run a gossip round to move it between devices.</span></div>
+            <button class="secondary" onclick="gossip(this)">🔄 Run Gossip Round</button>
+        </div>
+
+        <div class="flow-step step-bridge">
+            <div class="step-copy"><span class="step-num">3</span><strong>Upload from a bridge</strong>
+                <span class="small">The internet-connected device sends packets to the backend.</span></div>
+            <button class="secondary" onclick="flushBridges(this)">📡 Upload to backend</button>
+        </div>
+
+        <div class="flow-step step-reset reset-step">
+            <span class="small">Start the demo again by clearing the mesh and duplicate cache.</span>
+            <button class="danger" onclick="resetMesh(this)">🗑 Reset demo</button>
+        </div>
+    </div>
+
+    <div class="grid grid-2">
+        <div class="card mesh-card">
+            <h2>📱 Mesh Devices</h2>
+            <div id="devices"></div>
+        </div>
+
+        <div class="card accounts-card">
+            <h2>🏦 Account Balances</h2>
+            <div class="table-wrap"><table id="accounts-table">
+                <thead><tr><th>VPA</th><th>Holder</th><th>Balance</th></tr></thead>
+                <tbody></tbody>
+            </table></div>
+            <p class="small" id="cacheInfo"></p>
+        </div>
+    </div>
+
+    <div class="card section-card ledger-card">
+        <h2>📜 Transaction Ledger</h2>
+        <div class="table-wrap"><table id="tx-table">
+            <thead><tr>
+                <th>ID</th><th>From</th><th>To</th><th>Amount</th>
+                <th>Status</th><th>Bridge</th><th>Hops</th><th>Settled</th>
+            </tr></thead>
+            <tbody></tbody>
+        </table></div>
+    </div>
+
+    <div class="card section-card activity-card">
+        <h2>🪵 Activity Log</h2>
+        <div id="log"></div>
+    </div>
+</div>
+
+<script>
+let activeActions = 0;
+
+function log(msg) {
+    const el = document.getElementById('log');
+    el.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n' + el.textContent;
+}
+
+function setFeedback(message, state = 'success') {
+    const feedback = document.getElementById('actionFeedback');
+    feedback.textContent = message;
+    feedback.className = `action-feedback is-${state}`;
+}
+
+async function requestJson(url, options) {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+        throw new Error(`Request failed (${response.status}). Please try again.`);
+    }
+    return response.json();
+}
+
+async function runAction(button, pendingText, successText, action) {
+    const originalText = button.innerHTML;
+    activeActions++;
+    button.disabled = true;
+    button.classList.add('is-loading');
+    button.innerHTML = `<span class="spinner" aria-hidden="true"></span>${pendingText}`;
+    setFeedback(pendingText, 'loading');
+
+    try {
+        await action();
+        await refresh();
+        setFeedback(successText, 'success');
+    } catch (error) {
+        const message = error instanceof Error ? error.message : 'Something went wrong. Please try again.';
+        setFeedback(message, 'error');
+        log(`❌ ${message}`);
+    } finally {
+        button.disabled = false;
+        button.classList.remove('is-loading');
+        button.innerHTML = originalText;
+        activeActions--;
+    }
+}
+
+async function refresh() {
+    // Mesh state
+    const m = await requestJson('/api/mesh/state');
+    const devicesDiv = document.getElementById('devices');
+    devicesDiv.innerHTML = m.devices.map(d => `
+        <div class="device ${d.hasInternet ? 'bridge' : 'offline'}">
+            <strong>${d.deviceId}</strong>
+            <span class="badge ${d.hasInternet ? 'badge-online' : 'badge-offline'}">
+                ${d.hasInternet ? '🌐 4G' : '🚫 OFFLINE'}
+            </span>
+            <span class="small">holding ${d.packetCount} packet(s)</span>
+            <div>${d.packetIds.map(id => `<span class="packet-id">${id}</span>`).join('')}</div>
+        </div>
+    `).join('');
+    document.getElementById('cacheInfo').textContent =
+        `Idempotency cache size: ${m.idempotencyCacheSize}`;
+
+    // Accounts
+    const accs = await requestJson('/api/accounts');
+    document.querySelector('#accounts-table tbody').innerHTML = accs.map(a => `
+        <tr><td>${a.vpa}</td><td>${a.holderName}</td>
+            <td class="balance">₹${parseFloat(a.balance).toFixed(2)}</td></tr>
+    `).join('');
+
+    // Transactions
+    const txs = await requestJson('/api/transactions');
+    document.querySelector('#tx-table tbody').innerHTML = txs.map(t => `
+        <tr>
+            <td>${t.id}</td><td>${t.senderVpa}</td><td>${t.receiverVpa}</td>
+            <td class="balance">₹${parseFloat(t.amount).toFixed(2)}</td>
+            <td class="status-${t.status}">${t.status}</td>
+            <td>${t.bridgeNodeId}</td><td>${t.hopCount}</td>
+            <td class="small">${new Date(t.settledAt).toLocaleTimeString()}</td>
+        </tr>
+    `).join('');
+}
+
+function sendPacket(button) {
+    return runAction(button, 'Sending payment…', 'Payment packet sent to the mesh.', async () => {
+        const body = {
+            senderVpa: document.getElementById('senderVpa').value,
+            receiverVpa: document.getElementById('receiverVpa').value,
+            amount: parseFloat(document.getElementById('amount').value),
+            pin: document.getElementById('pin').value,
+            ttl: 5,
+            startDevice: 'phone-alice'
+        };
+        const r = await requestJson('/api/demo/send', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        log(`📤 Packet ${r.packetId.substring(0,8)} encrypted & injected at ${r.injectedAt} (TTL ${r.ttl})`);
+        log(`   ciphertext (truncated): ${r.ciphertextPreview}`);
+    });
+}
+
+function gossip(button) {
+    return runAction(button, 'Forwarding packet…', 'Gossip round completed.', async () => {
+        const r = await requestJson('/api/mesh/gossip', {method: 'POST'});
+        log(`🔄 Gossip: ${r.transfers} transfer(s) — ${JSON.stringify(r.deviceCounts)}`);
+    });
+}
+
+function flushBridges(button) {
+    return runAction(button, 'Uploading packets…', 'Bridge upload completed.', async () => {
+        const r = await requestJson('/api/mesh/flush', {method: 'POST'});
+        log(`📡 ${r.uploadsAttempted} bridge upload(s):`);
+        r.results.forEach(res => {
+            log(`   ${res.bridgeNode} packet ${res.packetId} → ${res.outcome}` +
+                (res.reason ? ` (${res.reason})` : ''));
+        });
+    });
+}
+
+function resetMesh(button) {
+    return runAction(button, 'Resetting demo…', 'Demo reset complete.', async () => {
+        await requestJson('/api/mesh/reset', {method: 'POST'});
+        log('🗑 mesh + idempotency cache cleared');
+    });
+}
+
+refresh().catch(error => setFeedback(error.message, 'error'));
+setInterval(() => {
+    refresh().catch(error => {
+        if (activeActions === 0) setFeedback(error.message, 'error');
+    });
+}, 3000);
+</script>
+</body>
+</html>
